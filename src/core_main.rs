@@ -3,10 +3,11 @@ use crate::client::translate;
 #[cfg(not(debug_assertions))]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use crate::platform::breakdown_callback;
-use hbb_common::{config, log};
 #[cfg(not(debug_assertions))]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use hbb_common::platform::register_breakdown_handler;
+use hbb_common::{config, log};
+//use hbb_common::{config::GNL_RD_PASS};
 #[cfg(windows)]
 use tauri_winrt_notification::{Duration, Sound, Toast};
 
@@ -111,7 +112,7 @@ pub fn core_main() -> Option<Vec<String>> {
         return core_main_invoke_new_connection(std::env::args());
     }
     let click_setup = cfg!(windows) && args.is_empty() && crate::common::is_setup(&arg_exe);
-    if click_setup && !config::is_disable_installation(){
+    if click_setup && !config::is_disable_installation() {
         args.push("--install".to_owned());
         flutter_args.push("--install".to_string());
     }
@@ -310,6 +311,21 @@ pub fn core_main() -> Option<Vec<String>> {
             if args.len() == 2 {
                 if crate::platform::is_installed() && is_root() {
                     if let Err(err) = crate::ipc::set_permanent_password(args[1].to_owned()) {
+                        println!("{err}");
+                    } else {
+                        println!("Done!");
+                    }
+                } else {
+                    println!("Installation and administrative privileges required!");
+                }
+            }
+            return None;
+        } else if args[0] == "--rd-pass" {
+            if !config::GNL_RD_PASS.read().unwrap().is_empty() {
+                if crate::platform::is_installed() && is_root() {
+                    if let Err(err) = crate::ipc::set_permanent_password(
+                        config::GNL_RD_PASS.read().unwrap().clone(),
+                    ) {
                         println!("{err}");
                     } else {
                         println!("Done!");

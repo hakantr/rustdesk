@@ -1960,6 +1960,10 @@ bool handleUriLink({List<String>? cmdArgs, Uri? uri, String? uriString}) {
         password = args[i + 1];
         i++;
         break;
+      case '--rd-pass':
+        password = args[i + 1];
+        i++;
+        break;
       case '--switch_uuid':
         switchUuid = args[i + 1];
         i++;
