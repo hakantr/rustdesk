@@ -4,6 +4,7 @@
 .idea
 .DS_Store
 libsciter-gtk.so
+libsciter.dylib
 src/ui/inline.rs
 extractor
 __pycache__
