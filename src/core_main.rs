@@ -7,7 +7,10 @@ use crate::platform::breakdown_callback;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use hbb_common::platform::register_breakdown_handler;
 use hbb_common::{config, log};
+<<<<<<< HEAD
 //use hbb_common::{config::GNL_RD_PASS};
+=======
+>>>>>>> upstream/master
 #[cfg(windows)]
 use tauri_winrt_notification::{Duration, Sound, Toast};
 
@@ -64,11 +67,7 @@ pub fn core_main() -> Option<Vec<String>> {
             ]
             .contains(&arg.as_str())
             {
-                if config::is_incoming_only() {
-                    return None;
-                } else {
-                    _is_flutter_invoke_new_connection = true;
-                }
+                _is_flutter_invoke_new_connection = true;
             }
             if arg == "--elevate" {
                 _is_elevate = true;

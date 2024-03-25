@@ -32,9 +32,13 @@ bool filterAbTagByIntersection() {
 const _personalAddressBookName = "My address book";
 const _legacyAddressBookName = "Legacy address book";
 
+enum ForcePullAb {
+  listAndCurrent,
+  current,
+}
+
 class AbModel {
   final addressbooks = Map<String, BaseAb>.fromEntries([]).obs;
-  List<AbProfile> abProfiles = List.empty(growable: true);
   final RxString _currentName = ''.obs;
   RxString get currentName => _currentName;
   final _dummyAb = DummyAb();
@@ -47,23 +51,18 @@ class AbModel {
   RxBool get currentAbLoading => current.abLoading;
   RxString get currentAbPullError => current.pullError;
   RxString get currentAbPushError => current.pushError;
-  bool get currentAbEmtpy => currentAbPeers.isEmpty && currentAbTags.isEmpty;
   String? _personalAbGuid;
   RxBool legacyMode = true.obs;
+  var _modeTested = false; // whether the mode has been tested
 
   final sortTags = shouldSortTags().obs;
   final filterByIntersection = filterAbTagByIntersection().obs;
 
-  // licensedDevices is obtained from personal ab, shared ab restrict it in server
-  var licensedDevices = 0;
-
   var _syncAllFromRecent = true;
   var _syncFromRecentLock = false;
-  var _allInitialized = false;
   var _timerCounter = 0;
   var _cacheLoadOnceFlag = false;
-  var _everPulledProfiles = false;
-  // ignore: unused_field
+  var listInitialized = false;
   var _maxPeerOneAb = 0;
 
   WeakReference<FFI> parent;
@@ -74,7 +73,8 @@ class AbModel {
       Timer.periodic(Duration(milliseconds: 500), (timer) async {
         if (_timerCounter++ % 6 == 0) {
           if (!gFFI.userModel.isLogin) return;
-          if (!_allInitialized) return;
+          if (!listInitialized) return;
+          if (!current.initialized || !current.canWrite()) return;
           _syncFromRecent();
         }
       });
@@ -83,77 +83,114 @@ class AbModel {
 
   reset() async {
     print("reset ab model");
-    _allInitialized = false;
-    abProfiles.clear();
+    _modeTested = false;
     addressbooks.clear();
     setCurrentName('');
     await bind.mainClearAb();
-    licensedDevices = 0;
-    _everPulledProfiles = false;
+    listInitialized = false;
   }
 
 // #region ab
-  Future<void> pullAb({force = true, quiet = false}) async {
-    await _pullAb(force: force, quiet: quiet);
-    _refreshTab();
+  /// Pulls the address book data from the server.
+  ///
+  /// If `force` is `ForcePullAb.listAndCurrent`, the function will pull the list of address books, current address book, and try initialize personal address book.
+  /// If `force` is `ForcePullAb.current`, the function will only pull the current address book.
+  /// If `quiet` is true, the function will not display any notifications or errors.
+  var _pulling = false;
+  Future<void> pullAb(
+      {required ForcePullAb? force, required bool quiet}) async {
+    if (_pulling) return;
+    _pulling = true;
+    try {
+      await _pullAb(force: force, quiet: quiet);
+      _refreshTab();
+    } catch (_) {}
+    _pulling = false;
   }
 
-  Future<void> _pullAb({force = true, quiet = false}) async {
-    debugPrint("pullAb, force:$force, quiet:$quiet");
+  Future<void> _pullAb(
+      {required ForcePullAb? force, required bool quiet}) async {
+    if (bind.isDisableAb()) return;
+    debugPrint("pullAb, force: $force, quiet: $quiet");
     if (!gFFI.userModel.isLogin) return;
-    if (!force && _allInitialized) return;
-    _allInitialized = false;
+    if (force == null && listInitialized && current.initialized) return;
     try {
-      // Get personal address book guid
-      _personalAbGuid = null;
-      await _getPersonalAbGuid();
-      // Determine legacy mode based on whether _personalAbGuid is null
-      legacyMode.value = _personalAbGuid == null;
-      if (_personalAbGuid != null) {
-        await _getAbSettings();
-        List<AbProfile> tmpAbProfiles = List.empty(growable: true);
-        tmpAbProfiles.add(AbProfile(_personalAbGuid!, _personalAddressBookName,
-            gFFI.userModel.userName.value, null, ShareRule.read.value));
-        // get all address book name
-        await _getSharedAbProfiles(tmpAbProfiles);
-        abProfiles = tmpAbProfiles;
-        addressbooks.clear();
-        for (int i = 0; i < abProfiles.length; i++) {
-          AbProfile p = abProfiles[i];
-          addressbooks[p.name] = Ab(p, p.guid == _personalAbGuid);
-        }
-      } else {
-        // only legacy address book
-        addressbooks.clear();
-        addressbooks[_legacyAddressBookName] = LegacyAb();
-      }
-      // set current address book name
-      if (!_everPulledProfiles) {
-        _everPulledProfiles = true;
-        final name = bind.getLocalFlutterOption(k: 'current-ab-name');
-        if (addressbooks.containsKey(name)) {
-          _currentName.value = name;
+      if (!_modeTested) {
+        // Get personal address book guid
+        _personalAbGuid = null;
+        await _getPersonalAbGuid();
+        // Determine legacy mode based on whether _personalAbGuid is null
+        legacyMode.value = _personalAbGuid == null;
+        _modeTested = true;
+        if (!legacyMode.value) {
+          await _getAbSettings();
         }
       }
-      if (!addressbooks.containsKey(_currentName.value)) {
-        setCurrentName(_personalAddressBookName);
-      }
-      // pull shared ab data, current first
-      await current.pullAb(force: force, quiet: quiet);
-      addressbooks.forEach((key, value) async {
-        if (key != current.name()) {
-          return await value.pullAb(force: force, quiet: quiet);
-        }
-      });
-      _saveCache();
-      _allInitialized = true;
-      _syncAllFromRecent = true;
     } catch (e) {
-      debugPrint("pullAb error: $e");
+      debugPrint("test ab mode error: $e");
     }
-    // again in case of error happens
-    if (!addressbooks.containsKey(_currentName.value)) {
-      setCurrentName(_personalAddressBookName);
+    if (!listInitialized || force == ForcePullAb.listAndCurrent) {
+      try {
+        if (_personalAbGuid != null) {
+          debugPrint("pull ab list");
+          List<AbProfile> abProfiles = List.empty(growable: true);
+          abProfiles.add(AbProfile(_personalAbGuid!, _personalAddressBookName,
+              gFFI.userModel.userName.value, null, ShareRule.read.value));
+          // get all address book name
+          await _getSharedAbProfiles(abProfiles);
+          addressbooks.removeWhere((key, value) =>
+              abProfiles.firstWhereOrNull((e) => e.name == key) == null);
+          for (int i = 0; i < abProfiles.length; i++) {
+            AbProfile p = abProfiles[i];
+            if (addressbooks.containsKey(p.name)) {
+              addressbooks[p.name]?.setSharedProfile(p);
+            } else {
+              addressbooks[p.name] = Ab(p, p.guid == _personalAbGuid);
+            }
+          }
+        } else {
+          // only legacy address book
+          addressbooks
+              .removeWhere((key, value) => key != _legacyAddressBookName);
+          if (!addressbooks.containsKey(_legacyAddressBookName)) {
+            addressbooks[_legacyAddressBookName] = LegacyAb();
+          }
+        }
+        // set current address book name
+        if (!listInitialized) {
+          listInitialized = true;
+          final name = bind.getLocalFlutterOption(k: 'current-ab-name');
+          if (addressbooks.containsKey(name)) {
+            _currentName.value = name;
+          }
+        }
+        if (!addressbooks.containsKey(_currentName.value)) {
+          setCurrentName(legacyMode.value
+              ? _legacyAddressBookName
+              : _personalAddressBookName);
+        }
+        // pull current address book
+        await current.pullAb(quiet: quiet);
+        // try initialize personal address book
+        if (!current.isPersonal()) {
+          final personalAb = addressbooks[_personalAddressBookName];
+          if (personalAb != null && !personalAb.initialized) {
+            await personalAb.pullAb(quiet: quiet);
+          }
+        }
+      } catch (e) {
+        debugPrint("pull ab list error: $e");
+      }
+    } else if (listInitialized &&
+        (!current.initialized || force == ForcePullAb.current)) {
+      try {
+        await current.pullAb(quiet: quiet);
+      } catch (e) {
+        debugPrint("pull current Ab error: $e");
+      }
+    }
+    if (listInitialized && current.initialized) {
+      _saveCache();
     }
   }
 
@@ -190,7 +227,7 @@ class AbModel {
       headers['Content-Type'] = "application/json";
       final resp = await http.post(Uri.parse(api), headers: headers);
       if (resp.statusCode == 404) {
-        debugPrint("HTTP 404, api server doesn't support shared address book");
+        debugPrint("HTTP 404, current api server is legacy mode");
         return false;
       }
       Map<String, dynamic> json =
@@ -209,7 +246,7 @@ class AbModel {
     return false;
   }
 
-  Future<bool> _getSharedAbProfiles(List<AbProfile> tmpSharedAbs) async {
+  Future<bool> _getSharedAbProfiles(List<AbProfile> profiles) async {
     final api = "${await bind.mainGetApiServer()}/api/ab/shared/profiles";
     try {
       var uri0 = Uri.parse(api);
@@ -245,11 +282,11 @@ class AbModel {
             if (data is List) {
               for (final profile in data) {
                 final u = AbProfile.fromJson(profile);
-                int index = tmpSharedAbs.indexWhere((e) => e.name == u.name);
+                int index = profiles.indexWhere((e) => e.name == u.name);
                 if (index < 0) {
-                  tmpSharedAbs.add(u);
+                  profiles.add(u);
                 } else {
-                  tmpSharedAbs[index] = u;
+                  profiles[index] = u;
                 }
               }
             }
@@ -473,11 +510,9 @@ class AbModel {
       final recents = await getRecentPeers();
       if (recents.isEmpty) return;
       debugPrint("sync from recent, len: ${recents.length}");
-      addressbooks.forEach((key, value) async {
-        if (value.canWrite()) {
-          await value.syncFromRecent(recents);
-        }
-      });
+      if (current.canWrite() && current.initialized) {
+        await current.syncFromRecent(recents);
+      }
     } catch (e) {
       debugPrint('_syncFromRecentWithoutLock: $e');
     }
@@ -508,6 +543,7 @@ class AbModel {
   List<dynamic> _serializeCache() {
     var res = [];
     addressbooks.forEach((key, value) {
+      if (!value.isPersonal() && key != current.name()) return;
       res.add({
         "guid": value.sharedProfile()?.guid ?? '',
         "name": key,
@@ -614,7 +650,8 @@ class AbModel {
     return addressbooks.keys.toList();
   }
 
-  void setCurrentName(String name) {
+  Future<void> setCurrentName(String name) async {
+    final oldName = _currentName.value;
     if (addressbooks.containsKey(name)) {
       _currentName.value = name;
     } else {
@@ -626,11 +663,23 @@ class AbModel {
         _currentName.value = '';
       }
     }
+    if (!current.initialized) {
+      await current.pullAb(quiet: true);
+      _saveCache();
+    }
     _refreshTab();
+    if (oldName != _currentName.value) {
+      _syncAllFromRecent = true;
+    }
   }
 
   bool isCurrentAbFull(bool warn) {
-    return current.isFull(warn);
+    final res = current.isFull();
+    if (res && warn) {
+      BotToast.showText(
+          contentColor: Colors.red, text: translate('exceed_max_devices'));
+    }
+    return res;
   }
 
   void _refreshTab() {
@@ -641,12 +690,12 @@ class AbModel {
   Future<void> pullNonLegacyAfterChange({String? name}) async {
     if (name == null) {
       if (current.name() != _legacyAddressBookName) {
-        return await current.pullAb(force: true, quiet: true);
+        return await current.pullAb(quiet: true);
       }
     } else if (name != _legacyAddressBookName) {
       final ab = addressbooks[name];
       if (ab != null) {
-        return ab.pullAb(force: true, quiet: true);
+        return await ab.pullAb(quiet: true);
       }
     }
   }
@@ -689,13 +738,7 @@ abstract class BaseAb {
   final pullError = "".obs;
   final pushError = "".obs;
   final abLoading = false.obs;
-
-  reset() {
-    pullError.value = '';
-    pushError.value = '';
-    tags.clear();
-    peers.clear();
-  }
+  bool initialized = false;
 
   String name();
 
@@ -704,18 +747,19 @@ abstract class BaseAb {
         name() == _legacyAddressBookName;
   }
 
-  Future<void> pullAb({force = true, quiet = false}) async {
+  Future<void> pullAb({quiet = false}) async {
+    debugPrint("pull ab \"${name()}\"");
     if (abLoading.value) return;
     if (!quiet) {
       abLoading.value = true;
       pullError.value = "";
     }
-    final ret = pullAbImpl(force: force, quiet: quiet);
+    initialized = false;
+    initialized = await pullAbImpl(quiet: quiet);
     abLoading.value = false;
-    return ret;
   }
 
-  Future<void> pullAbImpl({force = true, quiet = false});
+  Future<bool> pullAbImpl({quiet = false});
 
   Future<String?> addPeers(List<Map<String, dynamic>> ps);
   removeHash(Map<String, dynamic> p) {
@@ -748,24 +792,15 @@ abstract class BaseAb {
 
   Future<bool> deleteTag(String tag);
 
-  bool isFull(bool warn) {
-    bool res;
-    res = gFFI.abModel.licensedDevices > 0 &&
-        peers.length >= gFFI.abModel.licensedDevices;
-    if (res && warn) {
-      BotToast.showText(
-          contentColor: Colors.red, text: translate("exceed_max_devices"));
-    }
-    return res;
-  }
+  bool isFull();
+
+  void setSharedProfile(AbProfile profile);
 
   AbProfile? sharedProfile();
 
   bool canWrite();
 
   bool fullControl();
-
-  bool allowUpdateSettingsOrDelete();
 
   Future<void> syncFromRecent(List<Peer> recents);
 }
@@ -774,6 +809,8 @@ class LegacyAb extends BaseAb {
   final sortTags = shouldSortTags().obs;
   final filterByIntersection = filterAbTagByIntersection().obs;
   bool get emtpy => peers.isEmpty && tags.isEmpty;
+  // licensedDevices is obtained from personal ab, shared ab restrict it in server
+  var licensedDevices = 0;
 
   LegacyAb();
 
@@ -781,6 +818,9 @@ class LegacyAb extends BaseAb {
   AbProfile? sharedProfile() {
     return null;
   }
+
+  @override
+  void setSharedProfile(AbProfile? profile) {}
 
   @override
   bool canWrite() {
@@ -793,8 +833,8 @@ class LegacyAb extends BaseAb {
   }
 
   @override
-  bool allowUpdateSettingsOrDelete() {
-    return false;
+  bool isFull() {
+    return licensedDevices > 0 && peers.length >= licensedDevices;
   }
 
   @override
@@ -803,7 +843,8 @@ class LegacyAb extends BaseAb {
   }
 
   @override
-  Future<void> pullAbImpl({force = true, quiet = false}) async {
+  Future<bool> pullAbImpl({quiet = false}) async {
+    bool ret = false;
     final api = "${await bind.mainGetApiServer()}/api/ab";
     int? statusCode;
     try {
@@ -824,13 +865,14 @@ class LegacyAb extends BaseAb {
           throw json['error'];
         } else if (json.containsKey('data')) {
           try {
-            gFFI.abModel.licensedDevices = json['licensed_devices'];
+            licensedDevices = json['licensed_devices'];
             // ignore: empty_catches
           } catch (e) {}
           final data = jsonDecode(json['data']);
           if (data != null) {
             _deserialize(data);
           }
+          ret = true;
         }
       }
     } catch (err) {
@@ -845,6 +887,7 @@ class LegacyAb extends BaseAb {
         }
       }
     }
+    return ret;
   }
 
   Future<bool> pushAb(
@@ -862,7 +905,7 @@ class LegacyAb extends BaseAb {
       final body = jsonEncode({"data": jsonEncode(_serialize())});
       http.Response resp;
       // support compression
-      if (gFFI.abModel.licensedDevices > 0 && body.length > 1024) {
+      if (licensedDevices > 0 && body.length > 1024) {
         authHeaders['Content-Encoding'] = "gzip";
         resp = await http.post(Uri.parse(api),
             headers: authHeaders, body: GZipCodec().encode(utf8.encode(body)));
@@ -903,7 +946,7 @@ class LegacyAb extends BaseAb {
   Future<String?> addPeers(List<Map<String, dynamic>> ps) async {
     bool full = false;
     for (var p in ps) {
-      if (!isFull(false)) {
+      if (!isFull()) {
         p.remove('password'); // legacy ab ignore password
         final index = peers.indexWhere((e) => e.id == p['id']);
         if (index >= 0) {
@@ -981,7 +1024,7 @@ class LegacyAb extends BaseAb {
       var r = recents[i];
       var index = peers.indexWhere((e) => e.id == r.id);
       if (index < 0) {
-        if (!isFull(false)) {
+        if (!isFull()) {
           peers.add(r);
           needSync = true;
         }
@@ -1041,6 +1084,9 @@ class LegacyAb extends BaseAb {
     for (var e in tagList) {
       if (!tagContainBy(e)) {
         tags.add(e);
+      }
+      if (tagColors[e] == null) {
+        tagColors[e] = str2color2(e, existing: tagColors.values.toList()).value;
       }
     }
     return await pushAb();
@@ -1106,6 +1152,11 @@ class LegacyAb extends BaseAb {
   Map<String, dynamic> _serialize() {
     final peersJsonData =
         peers.map((e) => e.toPersonalAbUploadJson(true)).toList();
+    for (var e in tags) {
+      if (tagColors[e] == null) {
+        tagColors[e] = str2color2(e, existing: tagColors.values.toList()).value;
+      }
+    }
     final tagColorJsonData = jsonEncode(tagColors);
     return {
       "tags": tags,
@@ -1128,8 +1179,8 @@ class LegacyAb extends BaseAb {
         peers.add(Peer.fromJson(peer));
       }
     }
-    if (isFull(false)) {
-      peers.removeRange(gFFI.abModel.licensedDevices, peers.length);
+    if (isFull()) {
+      peers.removeRange(licensedDevices, peers.length);
     }
     // restore online
     peers
@@ -1150,7 +1201,7 @@ class LegacyAb extends BaseAb {
 }
 
 class Ab extends BaseAb {
-  late final AbProfile profile;
+  AbProfile profile;
   late final bool personal;
   final sortTags = shouldSortTags().obs;
   final filterByIntersection = filterAbTagByIntersection().obs;
@@ -1172,9 +1223,15 @@ class Ab extends BaseAb {
     return profile;
   }
 
-  bool creatorOrAdmin() {
-    return profile.owner == gFFI.userModel.userName.value ||
-        gFFI.userModel.isAdmin.value;
+  @override
+  void setSharedProfile(AbProfile profile) {
+    this.profile = profile;
+  }
+
+  @override
+  bool isFull() {
+    return gFFI.abModel._maxPeerOneAb > 0 &&
+        peers.length >= gFFI.abModel._maxPeerOneAb;
   }
 
   @override
@@ -1197,27 +1254,24 @@ class Ab extends BaseAb {
   }
 
   @override
-  bool allowUpdateSettingsOrDelete() {
-    if (personal) {
-      return false;
-    } else {
-      return creatorOrAdmin();
-    }
-  }
-
-  @override
-  Future<void> pullAbImpl({force = true, quiet = false}) async {
+  Future<bool> pullAbImpl({quiet = false}) async {
+    bool ret = true;
     List<Peer> tmpPeers = [];
-    await _fetchPeers(tmpPeers);
+    if (!await _fetchPeers(tmpPeers)) {
+      ret = false;
+    }
     peers.value = tmpPeers;
     List<AbTag> tmpTags = [];
-    await _fetchTags(tmpTags);
+    if (!await _fetchTags(tmpTags)) {
+      ret = false;
+    }
     tags.value = tmpTags.map((e) => e.name).toList();
     Map<String, int> tmpTagColors = {};
     for (var t in tmpTags) {
       tmpTagColors[t.name] = t.color;
     }
     tagColors.value = tmpTagColors;
+    return ret;
   }
 
   Future<bool> _fetchPeers(List<Peer> tmpPeers) async {
@@ -1322,7 +1376,7 @@ class Ab extends BaseAb {
         if (peers.firstWhereOrNull((e) => e.id == p['id']) != null) {
           continue;
         }
-        if (isFull(false)) {
+        if (isFull()) {
           return translate("exceed_max_devices");
         }
         if (personal) {
@@ -1625,8 +1679,13 @@ class Ab extends BaseAb {
 // DummyAb is for current ab is null
 class DummyAb extends BaseAb {
   @override
+  bool isFull() {
+    return false;
+  }
+
+  @override
   Future<String?> addPeers(List<Map<String, dynamic>> ps) async {
-    return "Unreachable";
+    return "dummpy";
   }
 
   @override
@@ -1642,11 +1701,6 @@ class DummyAb extends BaseAb {
 
   @override
   bool fullControl() {
-    return false;
-  }
-
-  @override
-  bool allowUpdateSettingsOrDelete() {
     return false;
   }
 
@@ -1682,11 +1736,13 @@ class DummyAb extends BaseAb {
 
   @override
   String name() {
-    return "Unreachable";
+    return "dummpy";
   }
 
   @override
-  Future<void> pullAbImpl({force = true, quiet = false}) async {}
+  Future<bool> pullAbImpl({quiet = false}) async {
+    return false;
+  }
 
   @override
   Future<bool> renameTag(String oldTag, String newTag) async {
@@ -1702,6 +1758,9 @@ class DummyAb extends BaseAb {
   AbProfile? sharedProfile() {
     return null;
   }
+
+  @override
+  void setSharedProfile(AbProfile profile) {}
 
   @override
   Future<void> syncFromRecent(List<Peer> recents) async {}
