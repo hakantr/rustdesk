@@ -63,7 +63,7 @@ let testSpeed = [0, 0];
 export function draw(display, frame) {
   if (yuvWorker) {
     // frame's (y/u/v).bytes already detached, can not transferrable any more.
-    yuvWorker.postMessage({display, frame});
+    yuvWorker.postMessage({ display, frame });
   } else {
     var tm0 = new Date().getTime();
     yuvCanvas.drawFrame(frame);
@@ -216,6 +216,9 @@ window.setByName = (name, value) => {
     case 'toggle_option':
       curConn.toggleOption(value);
       break;
+    case 'toggle_privacy_mode':
+      curConn.togglePrivacyMode(value);
+      break;
     case 'image_quality':
       curConn.setImageQuality(value);
       break;
@@ -266,6 +269,9 @@ window.setByName = (name, value) => {
       }
       curConn.inputMouse(mask, parseInt(value.x || '0'), parseInt(value.y || '0'), value.alt == 'true', value.ctrl == 'true', value.shift == 'true', value.command == 'true');
       break;
+    case 'send_2fa':
+      curConn.send2fa(value);
+      break;
     case 'option':
       value = JSON.parse(value);
       localStorage.setItem(value.name, value.value);
@@ -282,21 +288,18 @@ window.setByName = (name, value) => {
       value = JSON.parse(value);
       localStorage.setItem(name + ':' + value.name, value.value);
       break;
-    case 'option:peer':
+    case 'option:session':
       value = JSON.parse(value);
       curConn.setOption(value.name, value.value);
+      break;
+    case 'option:peer':
+      setPeerOption(value);
       break;
     case 'input_os_password':
       curConn.inputOsPassword(value);
       break;
     case 'check_conn_status':
       curConn.checkConnStatus();
-      break;
-    case 'remove_discovered':
-      removeDiscovered(value);
-      break;
-    case 'discover':
-      // TODO: discover
       break;
     case 'session_add_sync':
       return sessionAdd(value);
@@ -306,6 +309,27 @@ window.setByName = (name, value) => {
     case 'session_close':
       sessionClose(value);
       break;
+    case 'elevate_with_logon':
+      curConn.elevateWithLogon(value);
+      break;
+    case 'forget':
+      curConn.setRemember(false);
+      break;
+    case 'peer_has_password':
+      const options = getPeers()[value] || {};
+      return (options['password'] ?? '') !== '';
+    case 'peer_exists':
+      return !(!getPeers()[value]);
+    case 'restart':
+      curConn.restart();
+      break;
+    case 'fav':
+      return localStorage.setItem('fav', value);
+    case 'query_onlines':
+      queryOnlines(value);
+      break;
+    case 'change_prefer_codec':
+      curConn.changePreferCodec(value);
     default:
       break;
   }
@@ -318,22 +342,8 @@ window.getByName = (name, arg) => {
   return JSON.stringify(v);
 }
 
-function getPeersForDart() {
-  const peers = [];
-  for (const [id, value] of Object.entries(getPeers())) {
-    if (!id) continue;
-    const tm = value['tm'];
-    const info = value['info'];
-    if (!tm || !info) continue;
-    peers.push([tm, id, info]);
-  }
-  return peers.sort().reverse().map(x => x.slice(1));
-}
-
 function _getByName(name, arg) {
   switch (name) {
-    case 'peers':
-      return getPeersForDart();
     case 'remote_id':
       return localStorage.getItem('remote-id');
     case 'remember':
@@ -364,8 +374,10 @@ function _getByName(name, arg) {
     case 'translate':
       arg = JSON.parse(arg);
       return translate(arg.locale, arg.text);
-    case 'option:peer':
+    case 'option:session':
       return curConn.getOption(arg);
+    case 'option:peer':
+      return getPeerOption(arg);
     case 'option:toggle':
       return curConn.getToggleOption(arg);
     case 'get_conn_status':
@@ -379,29 +391,27 @@ function _getByName(name, arg) {
     case 'version':
       return version;
     case 'load_recent_peers':
-      const peersRecent = localStorage.getItem('peers-recent');
-      if (peersRecent) {
-        onRegisteredEvent(JSON.stringify({ name: 'load_recent_peers', peers: peersRecent }));
-      }
+      loadRecentPeers();
       break;
     case 'load_fav_peers':
-      const peersFav = localStorage.getItem('peers-fav');
-      if (peersFav) {
-        onRegisteredEvent(JSON.stringify({ name: 'load_fav_peers', peers: peersFav }));
-      }
+      loadFavPeers();
       break;
-    case 'load_lan_peers':
-      const peersLan = localStorage.getItem('peers-lan');
-      if (peersLan) {
-        onRegisteredEvent(JSON.stringify({ name: 'load_lan_peers', peers: peersLan }));
-      }
-      break;
+    case 'fav':
+      return localStorage.getItem('fav') ?? '[]';
     case 'load_recent_peers_sync':
-      return localStorage.getItem('peers-recent') ?? '{}';
-    case 'load_lan_peers_sync':
-      return localStorage.getItem('peers-lan') ?? '{}';
+      return JSON.stringify({
+        peers: JSON.stringify(getRecentPeers())
+      });
     case 'api_server':
       return getApiServer();
+    case 'is_using_public_server':
+      return !localStorage.getItem('custom-rendezvous-server');
+    case 'get_version_number':
+      return getVersionNumber(arg);
+    case 'audit_server':
+      return getAuditServer(arg);
+    case 'alternative_codecs':
+      return getAlternativeCodecs();
   }
   return '';
 }
@@ -436,14 +446,6 @@ export function getPeers() {
   return getJsonObj('peers');
 }
 
-export function getRecentPeers() {
-  return getJsonObj('peers-recent');
-}
-
-export function getLanPeers() {
-  return getJsonObj('peers-lan');
-}
-
 export function getJsonObj(key) {
   try {
     return JSON.parse(localStorage.getItem(key)) || {};
@@ -464,7 +466,6 @@ export function copyToClipboard(text) {
   if (window.clipboardData && window.clipboardData.setData) {
     // Internet Explorer-specific code path to prevent textarea being shown while dialog is visible.
     return window.clipboardData.setData("Text", text);
-
   }
   else if (document.queryCommandSupported && document.queryCommandSupported("copy")) {
     var textarea = document.createElement("textarea");
@@ -485,17 +486,117 @@ export function copyToClipboard(text) {
   }
 }
 
-// ========================== peers begin ==========================
-function removeDiscovered(id) {
+// Dup to the function in hbb_common, lib.rs
+// Maybe we need to move this function to js part.
+export function getVersionNumber(v) {
   try {
-    const v = localStorage.getItem('discovered');
-    if (!v) return;
-    const discovered = JSON.parse(localStorage.getItem('discovered'));
-    delete discovered[id];
-    localStorage.setItem('discovered', JSON.stringify(discovered));
-  } catch (e) {
-    console.error(e);
+    let versions = v.split('-');
+
+    let n = 0;
+
+    // The first part is the version number.
+    // 1.1.10 -> 1001100, 1.2.3 -> 1001030, multiple the last number by 10
+    // to leave space for patch version.
+    if (versions.length > 0) {
+      let last = 0;
+      for (let x of versions[0].split('.')) {
+        last = parseInt(x) || 0;
+        n = n * 1000 + last;
+      }
+      n -= last;
+      n += last * 10;
+    }
+
+    if (versions.length > 1) {
+      n += parseInt(versions[1]) || 0;
+    }
+
+    // Ignore the rest
+
+    return n;
   }
+  catch (e) {
+    console.error('Failed to parse version number: "' + v + '" ' + e.message);
+    return 0;
+  }
+}
+
+function getPeerOption(value) {
+  try {
+    const obj = JSON.parse(value);
+    const options = getPeers()[obj.id] || {};
+    return options[obj.name] || '';
+  }
+  catch (e) {
+    console.error('Failed to get peer option: "' + value + '", ' + e.message);
+  }
+}
+
+function setPeerOption(value) {
+  try {
+    const obj = JSON.parse(value);
+    const id = obj.id;
+    const name = obj.name;
+    const value = obj.value;
+    const peers = getPeers();
+    const options = peers[id] || {};
+
+    if (value == undefined) {
+      delete options[name];
+    } else {
+      options[name] = value;
+    }
+    options["tm"] = new Date().getTime();
+    peers[id] = options;
+    localStorage.setItem("peers", JSON.stringify(peers));
+  }
+  catch (e) {
+    console.error('Failed to set peer option: "' + value + '", ' + e.message);
+  }
+}
+
+// ========================== peers begin ==========================
+function getRecentPeers() {
+  const peers = [];
+  for (const [id, value] of Object.entries(getPeers())) {
+    if (!id) continue;
+    const tm = value['tm'];
+    const info = value['info'];
+    const cardInfo = {
+      id: id,
+      username: info['username'] || '',
+      hostname: info['hostname'] || '',
+      platform: info['platform'] || '',
+      alias: value.alias || '',
+    };
+    if (!tm || !cardInfo) continue;
+    peers.push([tm, id, cardInfo]);
+  }
+  return peers.sort().reverse().map(x => x[2]);
+}
+
+function loadRecentPeers() {
+  const peersRecent = getRecentPeers();
+  if (peersRecent) {
+    onRegisteredEvent(JSON.stringify({ name: 'load_recent_peers', peers: JSON.stringify(peersRecent) }));
+  }
+}
+
+function loadFavPeers() {
+  try {
+    const fav = localStorage.getItem('fav') ?? '[]';
+    const favs = JSON.parse(fav);
+    const peersFav = getRecentPeers().filter(x => favs.includes(x.id));
+    if (peersFav) {
+      onRegisteredEvent(JSON.stringify({ name: 'load_fav_peers', peers: JSON.stringify(peersFav) }));
+    }
+  } catch (e) {
+    console.error('Failed to load fav peers: ' + e.message);
+  }
+}
+
+export function queryOnlines(value) {
+  // TODO: implement this
 }
 // ========================== peers end ===========================
 
@@ -565,6 +666,17 @@ function increasePort(host, offset) {
   return host;
 }
 
+function getAlternativeCodecs() {
+  return JSON.stringify({
+    vp8: 1,
+    av1: 0,
+    h264: 1,
+    h265: 1,
+  });
+}
+// ========================== settings end ===========================
+
+// ========================== server begin ==========================
 function getApiServer() {
   const api_server = localStorage.getItem('api-server');
   if (api_server) {
@@ -582,4 +694,15 @@ function getApiServer() {
   }
   return 'https://admin.rustdesk.com';
 }
-// ========================== settings end ===========================
+
+function getAuditServer(typ) {
+  if (!localStorage.getItem("access_token")) {
+    return '';
+  }
+  const api_server = getApiServer();
+  if (!api_server || api_server.includes('rustdesk.com')) {
+    return '';
+  }
+  return api_server + '/api/audit/' + typ;
+}
+// ========================== server end ============================
