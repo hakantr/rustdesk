@@ -53,7 +53,7 @@ class AbModel {
   RxString get currentAbPullError => current.pullError;
   RxString get currentAbPushError => current.pushError;
   String? _personalAbGuid;
-  RxBool legacyMode = true.obs;
+  RxBool legacyMode = false.obs;
 
   final sortTags = shouldSortTags().obs;
   final filterByIntersection = filterAbTagByIntersection().obs;
@@ -151,10 +151,7 @@ class AbModel {
         // set current address book name
         if (!listInitialized) {
           listInitialized = true;
-          final name = bind.getLocalFlutterOption(k: 'current-ab-name');
-          if (addressbooks.containsKey(name)) {
-            _currentName.value = name;
-          }
+          trySetCurrentToLast();
         }
         if (!addressbooks.containsKey(_currentName.value)) {
           setCurrentName(legacyMode.value
@@ -323,7 +320,7 @@ class AbModel {
       peer['password'] = password;
     }
     final ret = await addPeersTo([peer], _currentName.value);
-    _timerCounter = 0;
+    _syncAllFromRecent = true;
     return ret;
   }
 
@@ -367,7 +364,7 @@ class AbModel {
     final personalAb = addressbooks[_personalAddressBookName];
     if (personalAb != null) {
       ret = await personalAb.changePersonalHashPassword(id, hash);
-      await pullNonLegacyAfterChange();
+      await personalAb.pullAb(quiet: true);
     } else {
       final legacyAb = addressbooks[_legacyAddressBookName];
       if (legacyAb != null) {
@@ -380,9 +377,10 @@ class AbModel {
 
   Future<bool> changeSharedPassword(
       String abName, String id, String password) async {
-    final ret =
-        await addressbooks[abName]?.changeSharedPassword(id, password) ?? false;
-    await pullNonLegacyAfterChange();
+    final ab = addressbooks[abName];
+    if (ab == null) return false;
+    final ret = await ab.changeSharedPassword(id, password);
+    await ab.pullAb(quiet: true);
     return ret;
   }
 
@@ -541,14 +539,19 @@ class AbModel {
         "name": key,
         "tags": value.tags,
         "peers": value.peers
-            .map((e) => value.isPersonal()
-                ? e.toPersonalAbUploadJson(true)
-                : e.toSharedAbCacheJson())
+            .map((e) => e.toCustomJson(includingHash: value.isPersonal()))
             .toList(),
         "tag_colors": jsonEncode(value.tagColors)
       });
     });
     return res;
+  }
+
+  trySetCurrentToLast() {
+    final name = bind.getLocalFlutterOption(k: 'current-ab-name');
+    if (addressbooks.containsKey(name)) {
+      _currentName.value = name;
+    }
   }
 
   Future<void> loadCache() async {
@@ -562,6 +565,8 @@ class AbModel {
       final data = jsonDecode(cache);
       if (data == null || data['access_token'] != access_token) return;
       _deserializeCache(data);
+      legacyMode.value = addressbooks.containsKey(_legacyAddressBookName);
+      trySetCurrentToLast();
     } catch (e) {
       debugPrint("load ab cache: $e");
     }
@@ -657,11 +662,11 @@ class AbModel {
     }
     if (!current.initialized) {
       await current.pullAb(quiet: false);
-      _saveCache();
     }
     _refreshTab();
     if (oldName != _currentName.value) {
       _syncAllFromRecent = true;
+      _saveCache();
     }
   }
 
@@ -737,6 +742,10 @@ abstract class BaseAb {
   bool isPersonal() {
     return name() == _personalAddressBookName ||
         name() == _legacyAddressBookName;
+  }
+
+  bool isLegacy() {
+    return name() == _legacyAddressBookName;
   }
 
   Future<void> pullAb({quiet = false}) async {
@@ -848,7 +857,7 @@ class LegacyAb extends BaseAb {
       final resp = await http.get(Uri.parse(api), headers: authHeaders);
       statusCode = resp.statusCode;
       if (resp.body.toLowerCase() == "null") {
-        // normal reply, emtpy ab return null
+        // normal reply, empty ab return null
         tags.clear();
         tagColors.clear();
         peers.clear();
@@ -1043,9 +1052,6 @@ class LegacyAb extends BaseAb {
     p.hostname = r.hostname.isEmpty ? p.hostname : r.hostname;
     p.platform = r.platform.isEmpty ? p.platform : r.platform;
     p.alias = p.alias.isEmpty ? r.alias : p.alias;
-    p.forceAlwaysRelay = r.forceAlwaysRelay;
-    p.rdpPort = r.rdpPort;
-    p.rdpUsername = r.rdpUsername;
   }
 
   @override
@@ -1145,7 +1151,7 @@ class LegacyAb extends BaseAb {
 
   Map<String, dynamic> _serialize() {
     final peersJsonData =
-        peers.map((e) => e.toPersonalAbUploadJson(true)).toList();
+        peers.map((e) => e.toCustomJson(includingHash: true)).toList();
     for (var e in tags) {
       if (tagColors[e] == null) {
         tagColors[e] = str2color2(e, existing: tagColors.values.toList()).value;
@@ -1484,39 +1490,56 @@ class Ab extends BaseAb {
   @override
   Future<bool> changePersonalHashPassword(String id, String hash) async {
     if (!personal) return false;
-    if (!peers.any((e) => e.id == id)) return false;
-    return _setPassword({"id": id, "hash": hash});
+    if (!peers.any((e) => e.id == id)) return true;
+    return await _setPassword({"id": id, "hash": hash});
   }
 
   @override
   Future<bool> changeSharedPassword(String id, String password) async {
     if (personal) return false;
-    return _setPassword({"id": id, "password": password});
+    return await _setPassword({"id": id, "password": password});
   }
 
   @override
   Future<void> syncFromRecent(List<Peer> recents) async {
     bool uiUpdate = false;
-    bool peerSyncEqual(Peer a, Peer b) {
-      return a.username == b.username &&
-          a.platform == b.platform &&
-          a.hostname == b.hostname;
-    }
+    bool saveCache = false;
+    final api =
+        "${await bind.mainGetApiServer()}/api/ab/peer/update/${profile.guid}";
+    var headers = getHttpHeaders();
+    headers['Content-Type'] = "application/json";
 
-    Future<bool> syncOnePeer(Peer p, Peer r) async {
-      p.username = r.username;
-      p.hostname = r.hostname;
-      p.platform = r.platform;
-      final api =
-          "${await bind.mainGetApiServer()}/api/ab/peer/update/${profile.guid}";
-      var headers = getHttpHeaders();
-      headers['Content-Type'] = "application/json";
-      final body = jsonEncode({
-        "id": p.id,
-        "username": r.username,
-        "hostname": r.hostname,
-        "platform": r.platform
-      });
+    Future<bool> trySyncOnePeer(Peer p, Peer r) async {
+      var map = Map<String, String>.fromEntries([]);
+      if (p.sameServer != true &&
+          r.username.isNotEmpty &&
+          p.username != r.username) {
+        p.username = r.username;
+        map['username'] = r.username;
+      }
+      if (p.sameServer != true &&
+          r.hostname.isNotEmpty &&
+          p.hostname != r.hostname) {
+        p.hostname = r.hostname;
+        map['hostname'] = r.hostname;
+      }
+      if (p.sameServer != true &&
+          r.platform.isNotEmpty &&
+          p.platform != r.platform) {
+        p.platform = r.platform;
+        map['platform'] = r.platform;
+      }
+      if (personal && r.hash.isNotEmpty && p.hash != r.hash) {
+        p.hash = r.hash;
+        map['hash'] = r.hash;
+        saveCache = true;
+      }
+      if (map.isEmpty) {
+        // no need to sync
+        return false;
+      }
+      map['id'] = p.id;
+      final body = jsonEncode(map);
       final resp = await http.put(Uri.parse(api), headers: headers, body: body);
       final errMsg = _jsonDecodeActionResp(resp);
       if (errMsg.isNotEmpty) {
@@ -1528,34 +1551,19 @@ class Ab extends BaseAb {
     }
 
     try {
-      /* Remove this because IDs that are not on the server can't be synced, then sync will happen every startup.
-      // Try add new peers to personal ab
-      if (personal) {
-        for (var r in recents) {
-          if (peers.length < gFFI.abModel._maxPeerOneAb) {
-            if (!peers.any((e) => e.id == r.id)) {
-              var err = await addPeers([r.toPersonalAbUploadJson(true)]);
-              if (err == null) {
-                peers.add(r);
-                uiUpdate = true;
-              }
-            }
-          }
-        }
-      }
-      */
-      final syncPeers = peers.where((p0) => p0.sameServer != true);
-      for (var p in syncPeers) {
+      // Not add new peers because IDs that are not on the server can't be synced, then sync will happen every startup.
+      for (var p in peers) {
         Peer? r = recents.firstWhereOrNull((e) => e.id == p.id);
         if (r != null) {
-          if (!peerSyncEqual(p, r)) {
-            await syncOnePeer(p, r);
-          }
+          await trySyncOnePeer(p, r);
         }
       }
       // Pull cannot be used for sync to avoid cyclic sync.
       if (uiUpdate && gFFI.abModel.currentName.value == profile.name) {
         peers.refresh();
+      }
+      if (saveCache) {
+        gFFI.abModel._saveCache();
       }
     } catch (err) {
       debugPrint('syncFromRecent err: ${err.toString()}');
