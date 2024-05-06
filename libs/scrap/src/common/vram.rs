@@ -16,7 +16,7 @@ use hbb_common::{
     ResultType,
 };
 use hwcodec::{
-    common::{DataFormat, Driver, MAX_GOP},
+    common::{AdapterVendor::*, DataFormat, Driver, MAX_GOP},
     vram::{
         decode::{self, DecodeFrame, Decoder},
         encode::{self, EncodeFrame, Encoder},
@@ -49,6 +49,7 @@ pub struct VRamEncoder {
     bitrate: u32,
     last_frame_len: usize,
     same_bad_len_counter: usize,
+    config: VRamEncoderConfig,
 }
 
 impl EncoderApi for VRamEncoder {
@@ -84,6 +85,7 @@ impl EncoderApi for VRamEncoder {
                         bitrate,
                         last_frame_len: 0,
                         same_bad_len_counter: 0,
+                        config,
                     }),
                     Err(_) => {
                         hbb_common::config::HwCodecConfig::clear_vram();
@@ -179,7 +181,7 @@ impl EncoderApi for VRamEncoder {
     }
 
     fn support_abr(&self) -> bool {
-        self.ctx.f.driver != Driver::VPL
+        self.config.device.vendor_id != ADAPTER_VENDOR_INTEL as u32
     }
 }
 
@@ -190,6 +192,10 @@ impl VRamEncoder {
             .filter(|e| e.luid == device.luid)
             .collect();
         if v.len() > 0 {
+            // prefer ffmpeg
+            if let Some(ctx) = v.iter().find(|c| c.driver == Driver::FFMPEG) {
+                return Some(ctx.clone());
+            }
             Some(v[0].clone())
         } else {
             None
@@ -250,21 +256,21 @@ impl VRamEncoder {
     pub fn convert_quality(quality: Quality, f: &FeatureContext) -> u32 {
         match quality {
             Quality::Best => {
-                if f.driver == Driver::VPL && f.data_format == DataFormat::H264 {
+                if f.driver == Driver::MFX && f.data_format == DataFormat::H264 {
                     200
                 } else {
                     150
                 }
             }
             Quality::Balanced => {
-                if f.driver == Driver::VPL && f.data_format == DataFormat::H264 {
+                if f.driver == Driver::MFX && f.data_format == DataFormat::H264 {
                     150
                 } else {
                     100
                 }
             }
             Quality::Low => {
-                if f.driver == Driver::VPL && f.data_format == DataFormat::H264 {
+                if f.driver == Driver::MFX && f.data_format == DataFormat::H264 {
                     75
                 } else {
                     50

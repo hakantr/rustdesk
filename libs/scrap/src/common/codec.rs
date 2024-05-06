@@ -180,7 +180,9 @@ impl Encoder {
         }
 
         let vp8_useable = decodings.len() > 0 && decodings.iter().all(|(_, s)| s.ability_vp8 > 0);
-        let av1_useable = decodings.len() > 0 && decodings.iter().all(|(_, s)| s.ability_av1 > 0);
+        let av1_useable = decodings.len() > 0
+            && decodings.iter().all(|(_, s)| s.ability_av1 > 0)
+            && !disable_av1();
         let _all_support_h264_decoding =
             decodings.len() > 0 && decodings.iter().all(|(_, s)| s.ability_h264 > 0);
         let _all_support_h265_decoding =
@@ -208,12 +210,13 @@ impl Encoder {
         let mut h265hw_encoding = None;
         #[cfg(feature = "hwcodec")]
         if enable_hwcodec_option() {
-            let best = HwRamEncoder::best();
             if _all_support_h264_decoding {
-                h264hw_encoding = best.h264.map_or(None, |c| Some(c.name));
+                h264hw_encoding =
+                    HwRamEncoder::try_get(CodecFormat::H264).map_or(None, |c| Some(c.name));
             }
             if _all_support_h265_decoding {
-                h265hw_encoding = best.h265.map_or(None, |c| Some(c.name));
+                h265hw_encoding =
+                    HwRamEncoder::try_get(CodecFormat::H265).map_or(None, |c| Some(c.name));
             }
         }
         let h264_useable =
@@ -249,8 +252,7 @@ impl Encoder {
 
         #[allow(unused_mut)]
         let mut auto_codec = CodecName::VP9;
-        // aom is very slow for x86 sciter version on windows x64
-        if av1_useable && !(cfg!(windows) && std::env::consts::ARCH == "x86") {
+        if av1_useable {
             auto_codec = CodecName::AV1;
         }
         let mut system = System::new();
@@ -306,7 +308,7 @@ impl Encoder {
         #[allow(unused_mut)]
         let mut encoding = SupportedEncoding {
             vp8: true,
-            av1: true,
+            av1: !disable_av1(),
             i444: Some(CodecAbility {
                 vp9: true,
                 av1: true,
@@ -317,9 +319,8 @@ impl Encoder {
         };
         #[cfg(feature = "hwcodec")]
         if enable_hwcodec_option() {
-            let best = HwRamEncoder::best();
-            encoding.h264 |= best.h264.is_some();
-            encoding.h265 |= best.h265.is_some();
+            encoding.h264 |= HwRamEncoder::try_get(CodecFormat::H264).is_some();
+            encoding.h265 |= HwRamEncoder::try_get(CodecFormat::H265).is_some();
         }
         #[cfg(feature = "vram")]
         if enable_vram_option() {
@@ -397,7 +398,7 @@ impl Decoder {
         let mut decoding = SupportedDecoding {
             ability_vp8: 1,
             ability_vp9: 1,
-            ability_av1: 1,
+            ability_av1: if disable_av1() { 0 } else { 1 },
             i444: Some(CodecAbility {
                 vp9: true,
                 av1: true,
@@ -410,9 +411,16 @@ impl Decoder {
         };
         #[cfg(feature = "hwcodec")]
         {
-            let best = HwRamDecoder::best();
-            decoding.ability_h264 |= if best.h264.is_some() { 1 } else { 0 };
-            decoding.ability_h265 |= if best.h265.is_some() { 1 } else { 0 };
+            decoding.ability_h264 |= if HwRamDecoder::try_get(CodecFormat::H264).is_some() {
+                1
+            } else {
+                0
+            };
+            decoding.ability_h265 |= if HwRamDecoder::try_get(CodecFormat::H265).is_some() {
+                1
+            } else {
+                0
+            };
         }
         #[cfg(feature = "vram")]
         if enable_vram_option() && _flutter {
@@ -906,4 +914,9 @@ pub fn codec_thread_num(limit: usize) -> usize {
         *THREAD_LOG_TIME.lock().unwrap() = Some(Instant::now());
     }
     res
+}
+
+fn disable_av1() -> bool {
+    // aom is very slow for x86 sciter version on windows x64
+    cfg!(windows) && std::env::consts::ARCH == "x86"
 }
