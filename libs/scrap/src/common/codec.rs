@@ -252,9 +252,6 @@ impl Encoder {
 
         #[allow(unused_mut)]
         let mut auto_codec = CodecName::VP9;
-        if av1_useable {
-            auto_codec = CodecName::AV1;
-        }
         let mut system = System::new();
         system.refresh_memory();
         if vp8_useable && system.total_memory() <= 4 * 1024 * 1024 * 1024 {
@@ -918,5 +915,6 @@ pub fn codec_thread_num(limit: usize) -> usize {
 
 fn disable_av1() -> bool {
     // aom is very slow for x86 sciter version on windows x64
-    cfg!(windows) && std::env::consts::ARCH == "x86"
+    // disable it for all 32 bit platforms
+    std::mem::size_of::<usize>() == 4
 }
